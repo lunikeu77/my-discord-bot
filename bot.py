@@ -311,6 +311,24 @@ async def execute_tool_dispatch(func_name: str, args: Dict[str, Any], message: d
     guild = message.guild
     channel = message.channel
 
+    # 관리 작업 실행 전 요청자 권한 확인
+    required_permissions = {
+        "create_channel": "manage_channels",
+        "delete_channel": "manage_channels",
+        "create_role": "manage_roles",
+        "purge_messages": "manage_messages",
+    }
+    required = required_permissions.get(func_name)
+    if required:
+        if guild is None:
+            return "이 관리 명령은 서버 안에서만 사용할 수 있습니다."
+        permissions = message.author.guild_permissions
+        if not getattr(permissions, required, False):
+            return (
+                "권한 부족: 해당 작업을 실행할 "
+                "서버 관리 권한이 없습니다."
+            )
+
     if func_name == "create_channel":
         name = args.get("name", "새-채널")
         channel_type = args.get("channel_type", "text")
@@ -513,7 +531,9 @@ async def create_web_app() -> web.Application:
         return web.json_response(data, status=200)
 
     async def health_handler(request: web.Request) -> web.Response:
-        return web.Response(text="OK", status=200)
+        if bot.is_ready():
+            return web.Response(text="OK", status=200)
+        return web.Response(text="Service Unavailable: Bot is not ready", status=503)
 
     app.router.add_get("/", root_handler)
     app.router.add_get("/health", health_handler)
@@ -531,15 +551,36 @@ async def main():
     await site.start()
     logger.info(f"🌐 HTTP 웹 서버가 포트 {PORT} (0.0.0.0:{PORT})에 성공적으로 바인딩되었습니다.")
 
-    # 2. 디스코드 봇 시작 (동일 이벤트 루프에서 실행)
+    # Discord 로그인 및 실행
     try:
         await bot.start(DISCORD_TOKEN)
     except discord.LoginFailure:
-        logger.critical("❌ 디스코드 토큰이 올바르지 않습니다. DISCORD_TOKEN 값을 확인해 주세요.")
-        sys.exit(1)
+        logger.critical(
+            "Discord 로그인 실패: DISCORD_TOKEN을 확인하세요."
+        )
+        raise
+    except discord.HTTPException as e:
+        error_text = str(e)
+        if e.status == 429:
+            logger.critical(
+                "Discord API 요청 제한(429)이 발생했습니다. "
+                "자동 재접속을 중단합니다."
+            )
+            if "1015" in error_text:
+                logger.critical(
+                    "Cloudflare 1015 차단이 감지되었습니다. "
+                    "Render 서버의 Discord API 접근이 제한된 상태입니다."
+                )
+            # 같은 인스턴스에서 반복적인 로그인 시도를 방지
+            await asyncio.Event().wait()
+        else:
+            logger.error(
+                "Discord HTTP 오류: 상태 코드 %s", e.status
+            )
+            raise
     except Exception as e:
         logger.critical(f"❌ 봇 구동 중 치명적 오류 발생: {e}")
-        sys.exit(1)
+        raise
     finally:
         logger.info("시스템 종료 절차를 진행합니다...")
         await runner.cleanup()
